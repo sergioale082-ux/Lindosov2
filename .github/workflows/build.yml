@@ -1,0 +1,1408 @@
+name: Build APK
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar arquivos do projeto
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'LINDOSO_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.lindoso.download"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.lindoso.download"
+                  minSdk = 29          // MediaStore.Downloads (sem pedir permissão de armazenamento)
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+                  isCoreLibraryDesugaringEnabled = true   // exigido pelo NewPipeExtractor
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging {
+                  resources.excludes += setOf("META-INF/*.kotlin_module", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "DebugProbesKt.bin")
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+              // Extração de YouTube (busca, sugestões, streams, playlists) — sem login e sem API key
+              // Confira a versão mais recente em https://jitpack.io/#TeamNewPipe/NewPipeExtractor
+              implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.24.6")
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.2")
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/proguard-rules.pro')"
+          cat > 'app/proguard-rules.pro' <<'LINDOSO_EOF'
+          -dontwarn javax.script.**
+          -dontwarn java.beans.**
+          -dontwarn jdk.dynalink.**
+          -dontwarn org.mozilla.javascript.tools.**
+          -keep class org.mozilla.javascript.** { *; }
+          -keep class org.schabi.newpipe.extractor.timeago.patterns.** { *; }
+          -keep class org.schabi.newpipe.extractor.services.youtube.protos.** { *; }
+          -keep class com.google.protobuf.** { *; }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'LINDOSO_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:name=".LindosoApp"
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.Lindoso"
+                  android:usesCleartextTraffic="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <!-- Aparece em Compartilhar do YouTube (igual ao Snaptube) -->
+                  <activity
+                      android:name=".ShareActivity"
+                      android:exported="true"
+                      android:excludeFromRecents="true"
+                      android:label="Lindoso Download"
+                      android:theme="@style/Theme.Lindoso.Sheet">
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".DlService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Dl.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/Dl.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.content.Context
+          import android.content.Intent
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.channels.Channel
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.update
+          import org.schabi.newpipe.extractor.MediaFormat
+          import org.schabi.newpipe.extractor.stream.StreamInfo
+          import org.schabi.newpipe.extractor.stream.VideoStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.ConcurrentHashMap
+
+          enum class St { QUEUED, RUNNING, PAUSED, WAITING, DONE, ERROR }
+
+          data class DlState(
+              val id: Long, val title: String, val url: String, val height: Int?,   // height == null -> só áudio
+              val progress: Float = 0f, val st: St = St.QUEUED, val msg: String = ""
+          )
+
+          private class PauseEx : Exception()
+          private class Picked(val urls: List<String>, val ext: String, val mime: String)
+
+          /** Fila de downloads: um por vez, pausa/retomada por HTTP Range, retry automático quando a internet cai. */
+          object Dl {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private val paused = ConcurrentHashMap.newKeySet<Long>()
+              private val queue = Channel<Long>(Channel.UNLIMITED)
+              private var seq = System.currentTimeMillis()
+              private lateinit var app: Context
+
+              val jobs = MutableStateFlow<List<DlState>>(emptyList())
+
+              fun start(ctx: Context) {
+                  if (::app.isInitialized) return
+                  app = ctx.applicationContext
+                  scope.launch { for (id in queue) runJob(id) }
+              }
+
+              fun enqueue(items: List<Pair<String, String>>, height: Int?) {
+                  val new = items.map { (u, t) -> DlState(++seq, t, u, height) }
+                  jobs.update { it + new }
+                  new.forEach { queue.trySend(it.id) }
+                  runCatching { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) }
+              }
+
+              fun pause(id: Long) { paused += id }
+              fun resume(id: Long) {
+                  paused -= id
+                  upd(id) { it.copy(st = St.QUEUED) }
+                  queue.trySend(id)
+                  runCatching { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) }
+              }
+
+              private fun upd(id: Long, f: (DlState) -> DlState) = jobs.update { l -> l.map { if (it.id == id) f(it) else it } }
+
+              private fun h(s: VideoStream) = s.resolution.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+
+              private fun pick(info: StreamInfo, height: Int?): Picked {
+                  val a = info.audioStreams.filter { it.format == MediaFormat.M4A }.maxByOrNull { it.averageBitrate }
+                  if (height == null) return Picked(listOf((a ?: error("sem áudio disponível")).content), "m4a", "audio/mp4")
+                  val muxed = info.videoStreams.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
+                  val vo = info.videoOnlyStreams.filter { it.format == MediaFormat.MPEG_4 && h(it) <= height }.maxByOrNull { h(it) }
+                  return when {
+                      vo != null && a != null && h(vo) > (muxed?.let { h(it) } ?: 0) -> Picked(listOf(vo.content, a.content), "mp4", "video/mp4")
+                      muxed != null -> Picked(listOf(muxed.content), "mp4", "video/mp4")
+                      else -> error("formato indisponível para este vídeo")
+                  }
+              }
+
+              private suspend fun runJob(id: Long) {
+                  val s = jobs.value.firstOrNull { it.id == id } ?: return
+                  if (id in paused) { upd(id) { it.copy(st = St.PAUSED) }; return }
+                  upd(id) { it.copy(st = St.RUNNING, msg = "") }
+                  var tries = 0
+                  while (true) {
+                      try {
+                          val info = StreamInfo.getInfo(s.url)
+                          upd(id) { it.copy(title = info.name) }
+                          val p = pick(info, s.height)
+                          val dir = File(app.cacheDir, "dl").also { it.mkdirs() }
+                          val parts = p.urls.indices.map { File(dir, "$id-$it.part") }
+                          p.urls.forEachIndexed { i, u ->
+                              fetch(id, u, parts[i]) { fr -> upd(id) { it.copy(progress = (i + fr) / p.urls.size, st = St.RUNNING, msg = "") } }
+                          }
+                          val out = if (parts.size == 2) File(dir, "$id.mp4").also { Muxer.mux(parts[0], parts[1], it) } else parts[0]
+                          val safe = info.name.replace(Regex("""[\\/:*?"<>|]"""), "_").take(80)
+                          Library.save(app, out, "$safe.${p.ext}", p.mime)
+                          parts.forEach { it.delete() }; out.delete()
+                          upd(id) { it.copy(progress = 1f, st = St.DONE) }
+                          return
+                      } catch (e: PauseEx) {
+                          upd(id) { it.copy(st = St.PAUSED) }; return
+                      } catch (e: IOException) {                       // internet caiu: espera e continua de onde parou
+                          if (++tries > 30) { upd(id) { it.copy(st = St.ERROR, msg = "Sem conexão") }; return }
+                          upd(id) { it.copy(st = St.WAITING, msg = "Aguardando internet…") }
+                          delay(5000)
+                          if (id in paused) { upd(id) { it.copy(st = St.PAUSED) }; return }
+                      } catch (e: Throwable) {
+                          upd(id) { it.copy(st = St.ERROR, msg = "${e.javaClass.simpleName}: ${e.message}") }; return
+                      }
+                  }
+              }
+
+              /** Baixa em blocos de 5 MB com Range (o YouTube limita a velocidade de requisições sem Range) e retoma pelo tamanho do .part. */
+              private fun fetch(id: Long, url: String, f: File, prog: (Float) -> Unit) {
+                  val chunk = 5_000_000L
+                  var have = f.length()
+                  while (true) {
+                      if (id in paused) throw PauseEx()
+                      val c = URL(url).openConnection() as HttpURLConnection
+                      c.connectTimeout = 15000; c.readTimeout = 20000
+                      c.setRequestProperty("User-Agent", UA)
+                      c.setRequestProperty("Range", "bytes=$have-${have + chunk - 1}")
+                      val code = c.responseCode
+                      if (code == 416) { c.disconnect(); return }                 // já estava completo
+                      if (code != 206 && code != 200) { c.disconnect(); throw IOException("HTTP $code") }
+                      val total = c.getHeaderField("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: c.contentLengthLong
+                      if (code == 200 && have > 0) { f.delete(); have = 0 }       // servidor ignorou o Range
+                      FileOutputStream(f, have > 0).use { o ->
+                          c.inputStream.use { i ->
+                              val b = ByteArray(32 * 1024)
+                              while (true) {
+                                  val n = i.read(b); if (n < 0) break
+                                  o.write(b, 0, n); have += n
+                                  prog(if (total > 0) (have.toFloat() / total).coerceIn(0f, 1f) else 0f)
+                                  if (id in paused) throw PauseEx()
+                              }
+                          }
+                      }
+                      c.disconnect()
+                      if (total <= 0 || have >= total) return
+                  }
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/DlService.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/DlService.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.IBinder
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.collect
+
+          /** Serviço em primeiro plano: mantém o download vivo com o app minimizado. */
+          class DlService : Service() {
+              private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+              private var watcher: Job? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("dl", "Downloads", NotificationManager.IMPORTANCE_LOW))
+                  runCatching { startForeground(1, build("Iniciando…", 0), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) }
+                  if (watcher == null) watcher = scope.launch {
+                      Dl.jobs.collect { l ->
+                          val active = l.filter { it.st == St.RUNNING || it.st == St.QUEUED || it.st == St.WAITING }
+                          if (active.isEmpty()) { stopSelf(); return@collect }
+                          val cur = active.first()
+                          nm.notify(1, build("${active.size} em andamento • ${cur.title}", (cur.progress * 100).toInt()))
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun build(text: String, pct: Int): Notification =
+                  Notification.Builder(this, "dl")
+                      .setSmallIcon(android.R.drawable.stat_sys_download)
+                      .setContentTitle("Lindoso Download")
+                      .setContentText(text)
+                      .setProgress(100, pct.coerceIn(0, 100), false)
+                      .setOngoing(true)
+                      .build()
+
+              override fun onDestroy() { scope.cancel(); watcher = null; super.onDestroy() }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/HttpDownloader.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/HttpDownloader.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import org.schabi.newpipe.extractor.downloader.Downloader
+          import org.schabi.newpipe.extractor.downloader.Request
+          import org.schabi.newpipe.extractor.downloader.Response
+          import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          const val UA = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+          /** Downloader mínimo (HttpURLConnection) exigido pelo NewPipeExtractor — sem OkHttp para manter o APK leve. */
+          class HttpDownloader : Downloader() {
+              override fun execute(request: Request): Response {
+                  val c = URL(request.url()).openConnection() as HttpURLConnection
+                  c.requestMethod = request.httpMethod()
+                  c.connectTimeout = 15000
+                  c.readTimeout = 20000
+                  c.setRequestProperty("User-Agent", UA)
+                  request.headers().forEach { (k, v) -> c.setRequestProperty(k, v.joinToString(", ")) }
+                  request.dataToSend()?.let { c.doOutput = true; c.outputStream.use { o -> o.write(it) } }
+
+                  val code = c.responseCode
+                  if (code == 429) throw ReCaptchaException("reCaptcha", request.url())
+                  val body = (if (code in 200..399) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                  return Response(code, c.responseMessage, c.headerFields.filterKeys { it != null }, body, c.url.toString())
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Library.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/Library.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.content.ContentUris
+          import android.content.ContentValues
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.MediaStore
+          import java.io.File
+
+          data class LFile(val uri: Uri, val name: String, val size: Long, val mime: String) {
+              val isAudio get() = mime.startsWith("audio")
+          }
+
+          /** Pasta pública Download/Lindoso Download/ via MediaStore (Android 10+ não exige permissão de armazenamento). */
+          object Library {
+              private const val REL = "Download/Lindoso Download/"
+              private val base = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+
+              fun save(ctx: Context, src: File, name: String, mime: String) {
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, name)
+                      put(MediaStore.Downloads.MIME_TYPE, mime)
+                      put(MediaStore.Downloads.RELATIVE_PATH, REL)
+                  }
+                  val uri = ctx.contentResolver.insert(base, cv) ?: error("não foi possível salvar")
+                  ctx.contentResolver.openOutputStream(uri)!!.use { o -> src.inputStream().use { it.copyTo(o) } }
+              }
+
+              fun list(ctx: Context): List<LFile> {
+                  val out = mutableListOf<LFile>()
+                  val cols = arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME, MediaStore.Downloads.SIZE, MediaStore.Downloads.MIME_TYPE)
+                  ctx.contentResolver.query(base, cols, "${MediaStore.Downloads.RELATIVE_PATH} = ?", arrayOf(REL), "${MediaStore.Downloads.DATE_ADDED} DESC")?.use { c ->
+                      while (c.moveToNext()) out += LFile(ContentUris.withAppendedId(base, c.getLong(0)), c.getString(1), c.getLong(2), c.getString(3) ?: "")
+                  }
+                  return out
+              }
+
+              fun rename(ctx: Context, f: LFile, newName: String) =
+                  ctx.contentResolver.update(f.uri, ContentValues().apply { put(MediaStore.Downloads.DISPLAY_NAME, newName) }, null, null)
+
+              fun delete(ctx: Context, f: LFile) = ctx.contentResolver.delete(f.uri, null, null)
+
+              /** Mover para outro local (cartão SD, outra pasta): o usuário escolhe o destino no seletor do sistema. */
+              fun moveTo(ctx: Context, f: LFile, dest: Uri) {
+                  ctx.contentResolver.openInputStream(f.uri)!!.use { i -> ctx.contentResolver.openOutputStream(dest)!!.use { o -> i.copyTo(o) } }
+                  delete(ctx, f)
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/LindosoApp.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/LindosoApp.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.app.Application
+          import android.util.Log
+          import java.io.File
+
+          class LindosoApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val old = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      runCatching { File(filesDir, "crash.txt").writeText(Log.getStackTraceString(e)) }
+                      old?.uncaughtException(t, e)
+                  }
+                  YtRepo.init()
+                  Dl.start(this)
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/MainActivity.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/MainActivity.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.Manifest
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  setContent {
+                      LindosoTheme {
+                          CopyrightNotice(onExit = { finish() })
+                          CrashReport()
+                          App()
+                      }
+                  }
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Muxer.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/Muxer.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaMuxer
+          import java.io.File
+          import java.nio.ByteBuffer
+
+          /** Junta vídeo (H.264) + áudio (AAC) em um MP4 usando só APIs nativas do Android (zero KB extra no APK). */
+          object Muxer {
+              fun mux(video: File, audio: File, out: File) {
+                  val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                  val ve = MediaExtractor().apply { setDataSource(video.path) }
+                  val ae = MediaExtractor().apply { setDataSource(audio.path) }
+                  try {
+                      val vt = track(ve, "video/"); val at = track(ae, "audio/")
+                      ve.selectTrack(vt); ae.selectTrack(at)
+                      val vi = m.addTrack(ve.getTrackFormat(vt)); val ai = m.addTrack(ae.getTrackFormat(at))
+                      m.start()
+                      copy(ve, m, vi); copy(ae, m, ai)
+                      m.stop()
+                  } finally { ve.release(); ae.release(); m.release() }
+              }
+
+              private fun track(e: MediaExtractor, prefix: String): Int =
+                  (0 until e.trackCount).first { e.getTrackFormat(it).getString("mime")!!.startsWith(prefix) }
+
+              private fun copy(e: MediaExtractor, m: MediaMuxer, idx: Int) {
+                  val buf = ByteBuffer.allocate(1 shl 20)
+                  val info = MediaCodec.BufferInfo()
+                  while (true) {
+                      val n = e.readSampleData(buf, 0)
+                      if (n < 0) break
+                      info.set(0, n, e.sampleTime, if (e.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                      m.writeSampleData(idx, buf, info)
+                      e.advance()
+                  }
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/ShareActivity.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/ShareActivity.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.launch
+
+          /** Aparece no menu Compartilhar do YouTube: escolhe o formato e baixa, sem abrir o app. */
+          class ShareActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+                  if (!YtRepo.isYt(text)) { toast("Link do YouTube não encontrado"); finish(); return }
+                  if (!getSharedPreferences("p", MODE_PRIVATE).getBoolean("ok", false)) {
+                      toast("Abra o Lindoso Download uma vez para aceitar o aviso de direitos autorais"); finish(); return
+                  }
+                  val url = YtRepo.extract(text)
+                  setContent {
+                      LindosoTheme {
+                          val scope = rememberCoroutineScope()
+                          var busy by remember { mutableStateOf(false) }
+                          Box(
+                              Modifier.fillMaxSize().clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { finish() },
+                              contentAlignment = Alignment.BottomCenter
+                          ) {
+                              Column(
+                                  Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)).background(Color(0xFF151515))
+                                      .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                                      .padding(20.dp)
+                              ) {
+                                  FormatPicker(url, YtRepo.hasList(url), busy) { h, whole ->
+                                      scope.launch {
+                                          busy = true
+                                          startDownload(url, url, whole, h)
+                                          toast("Baixando… acompanhe em Lindoso Download")
+                                          finish()
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/Ui.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/Ui.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.app.Activity
+          import android.view.ViewGroup
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.MediaController
+          import androidx.activity.compose.BackHandler
+          import android.widget.VideoView
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.List
+          import androidx.compose.material.icons.filled.Home
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Dialog
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.compose.LocalLifecycleOwner
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.net.URL
+
+          val Turq = Color(0xFF00E5C7)
+
+          @Composable
+          fun LindosoTheme(content: @Composable () -> Unit) = MaterialTheme(
+              colorScheme = darkColorScheme(
+                  primary = Turq, onPrimary = Color.Black, background = Color.Black, onBackground = Color.White,
+                  surface = Color.Black, onSurface = Color.White, surfaceVariant = Color(0xFF111111),
+                  onSurfaceVariant = Color(0xFFB0B0B0), secondaryContainer = Color(0xFF0F2B28), onSecondaryContainer = Turq
+              ), content = content
+          )
+
+          /** Aviso de direitos autorais na primeira abertura. */
+          @Composable
+          fun CopyrightNotice(onExit: () -> Unit) {
+              val ctx = LocalContext.current
+              val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
+              var show by remember { mutableStateOf(!prefs.getBoolean("ok", false)) }
+              if (!show) return
+              AlertDialog(
+                  onDismissRequest = {}, containerColor = Color(0xFF111111),
+                  title = { Text("Aviso de direitos autorais") },
+                  text = {
+                      Text(
+                          "O Lindoso Download deve ser usado apenas para baixar conteúdos seus, com licença livre " +
+                              "(Creative Commons) ou com autorização expressa do autor. Baixar conteúdo protegido sem permissão " +
+                              "pode violar leis de direitos autorais e os Termos de Serviço do YouTube. A responsabilidade pelo uso é sua."
+                      )
+                  },
+                  confirmButton = { TextButton({ prefs.edit().putBoolean("ok", true).apply(); show = false }) { Text("Entendi e aceito", color = Turq) } },
+                  dismissButton = { TextButton(onExit) { Text("Sair", color = Color.Gray) } }
+              )
+          }
+
+          @Composable
+          fun App() {
+              var tab by remember { mutableIntStateOf(0) }
+              Scaffold(
+                  containerColor = Color.Black,
+                  bottomBar = {
+                      NavigationBar(containerColor = Color.Black) {
+                          val items = listOf("Início" to Icons.Default.Home, "Pesquisar" to Icons.Default.Search, "Biblioteca" to Icons.AutoMirrored.Filled.List)
+                          items.forEachIndexed { i, (label, icon) ->
+                              NavigationBarItem(
+                                  selected = tab == i, onClick = { tab = i },
+                                  icon = { Icon(icon, label) }, label = { Text(label) },
+                                  colors = NavigationBarItemDefaults.colors(selectedIconColor = Color.Black, indicatorColor = Turq, selectedTextColor = Turq)
+                              )
+                          }
+                      }
+                  }
+              ) { p ->
+                  Box(Modifier.padding(p).fillMaxSize()) {
+                      when (tab) { 0 -> HomeTab(); 1 -> SearchTab(); else -> LibraryTab() }
+                  }
+              }
+          }
+
+          fun isVideoUrl(u: String) = YtRepo.isYt(u) &&
+              (u.contains("watch?v=") || u.contains("/shorts/") || u.contains("youtu.be/") || u.contains("list="))
+
+          /** WebView do YouTube mantido vivo entre as abas (não recarrega ao trocar de aba). */
+          object Web {
+              var view: WebView? = null
+              fun get(c: Context, onUrl: (String) -> Unit): WebView {
+                  val w = view ?: WebView(c).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      setBackgroundColor(android.graphics.Color.BLACK)
+                      loadUrl("https://m.youtube.com")
+                  }.also { view = it }
+                  (w.parent as? ViewGroup)?.removeView(w)
+                  w.webViewClient = object : WebViewClient() {
+                      override fun doUpdateVisitedHistory(v: WebView, url: String, isReload: Boolean) { onUrl(url) }
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest) = r.url.scheme?.startsWith("http") != true
+                  }
+                  return w
+              }
+          }
+
+          // ───────────────────────── Início ─────────────────────────
+          @Composable
+          fun HomeTab() {
+              val ctx = LocalContext.current
+              var dialogUrl by remember { mutableStateOf<String?>(null) }
+              var webUrl by remember { mutableStateOf(Web.view?.url ?: "") }
+              val jobs by Dl.jobs.collectAsState()
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      androidx.compose.foundation.Image(androidx.compose.ui.res.painterResource(R.drawable.ic_launcher), null, Modifier.size(40.dp))
+                      Spacer(Modifier.width(10.dp))
+                      Text("Lindoso Download", color = Turq, style = MaterialTheme.typography.headlineSmall)
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  // YouTube embutido no meio da tela
+                  Box(Modifier.weight(1f).fillMaxWidth()) {
+                      BackHandler { val w = Web.view; if (w != null && w.canGoBack()) w.goBack() else (ctx as? Activity)?.finish() }
+                      AndroidView({ c -> Web.get(c) { webUrl = it } }, Modifier.fillMaxSize())
+                  }
+                  if (isVideoUrl(webUrl)) {
+                      Button(
+                          { dialogUrl = webUrl }, Modifier.fillMaxWidth().padding(top = 8.dp),
+                          colors = ButtonDefaults.buttonColors(containerColor = Turq, contentColor = Color.Black)
+                      ) { Text("Baixar este vídeo") }
+                  }
+                  if (jobs.isNotEmpty()) {
+                      Text("Downloads", color = Color.Gray, modifier = Modifier.padding(top = 8.dp))
+                      LazyColumn(Modifier.heightIn(max = 150.dp)) { items(jobs.reversed(), key = { it.id }) { JobRow(it) } }
+                  }
+              }
+              dialogUrl?.let { FormatDialog(it, it) { dialogUrl = null } }
+          }
+
+          @Composable
+          fun JobRow(j: DlState) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                  Text(j.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                  LinearProgressIndicator(progress = { j.progress }, Modifier.fillMaxWidth().padding(vertical = 4.dp), color = Turq, trackColor = Color(0xFF222222))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Text(
+                          when (j.st) {
+                              St.QUEUED -> "Na fila"; St.RUNNING -> "${(j.progress * 100).toInt()}%"; St.PAUSED -> "Pausado"
+                              St.WAITING -> j.msg; St.DONE -> "Concluído ✓"; St.ERROR -> "Erro: ${j.msg}"
+                          }, color = Color.Gray, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall
+                      )
+                      when (j.st) {
+                          St.RUNNING, St.WAITING, St.QUEUED -> TextButton({ Dl.pause(j.id) }) { Text("Pausar", color = Turq) }
+                          St.PAUSED, St.ERROR -> TextButton({ Dl.resume(j.id) }) { Text("Retomar", color = Turq) }
+                          else -> {}
+                      }
+                  }
+              }
+          }
+
+          // ───────────────────────── Escolha de formato ─────────────────────────
+          @Composable
+          private fun PickRow(label: String, selected: Boolean, onClick: () -> Unit) {
+              Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                  Text(label, Modifier.weight(1f))
+                  RadioButton(selected, onClick, colors = RadioButtonDefaults.colors(selectedColor = Turq, unselectedColor = Color.Gray))
+              }
+          }
+
+          /** Seletor estilo Snaptube: Música / Vídeo / Mais formatos + botão Baixar. */
+          @Composable
+          fun FormatPicker(title: String, hasList: Boolean, busy: Boolean, onGo: (height: Int?, whole: Boolean) -> Unit) {
+              var sel by remember { mutableIntStateOf(0) }        // 0 = áudio, senão a altura do vídeo
+              var more by remember { mutableStateOf(false) }
+              var whole by remember { mutableStateOf(false) }
+              Column {
+                  Text("Baixar vídeo como", style = MaterialTheme.typography.titleLarge)
+                  Text(title, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                  Spacer(Modifier.height(12.dp))
+                  Text("Música", color = Color.Gray)
+                  PickRow("Rápido (áudio M4A)", sel == 0) { sel = 0 }
+                  Text("Vídeo", color = Color.Gray)
+                  PickRow("Rápido (360p)", sel == 360) { sel = 360 }
+                  PickRow("Alta qualidade (720p)", sel == 720) { sel = 720 }
+                  Row(Modifier.fillMaxWidth().clickable { more = !more }.padding(vertical = 10.dp)) {
+                      Text("Mais formatos", Modifier.weight(1f))
+                      Text(if (more) "▲" else "Todos ›", color = Color.Gray)
+                  }
+                  if (more) {
+                      PickRow("144p (menor)", sel == 144) { sel = 144 }
+                      PickRow("1080p (Full HD)", sel == 1080) { sel = 1080 }
+                  }
+                  if (hasList) Row(Modifier.clickable { whole = !whole }, verticalAlignment = Alignment.CenterVertically) {
+                      Checkbox(whole, { whole = it }, colors = CheckboxDefaults.colors(checkedColor = Turq, checkmarkColor = Color.Black))
+                      Text("Baixar playlist inteira")
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  if (busy) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Turq)
+                  else Button(
+                      { onGo(if (sel == 0) null else sel, whole) }, Modifier.fillMaxWidth(),
+                      colors = ButtonDefaults.buttonColors(containerColor = Turq, contentColor = Color.Black)
+                  ) { Text("Baixar") }
+              }
+          }
+
+          suspend fun startDownload(url: String, title: String, whole: Boolean, height: Int?) {
+              val items = if (whole) runCatching { YtRepo.playlist(YtRepo.playlistUrl(url)).map { it.url to it.title } }.getOrDefault(emptyList())
+              else listOf(url to title)
+              if (items.isNotEmpty()) Dl.enqueue(items, height)
+          }
+
+          @Composable
+          fun FormatDialog(url: String, title: String, onDone: () -> Unit) {
+              val scope = rememberCoroutineScope()
+              var busy by remember { mutableStateOf(false) }
+              AlertDialog(
+                  onDismissRequest = onDone, containerColor = Color(0xFF111111),
+                  text = {
+                      FormatPicker(title, YtRepo.hasList(url), busy) { h, whole ->
+                          scope.launch { busy = true; startDownload(url, title, whole, h); onDone() }
+                      }
+                  },
+                  confirmButton = {}, dismissButton = { TextButton(onDone) { Text("Cancelar", color = Color.Gray) } }
+              )
+          }
+
+          /** Se o app fechou por erro, mostra o motivo na próxima abertura (dá para copiar e me enviar). */
+          @Composable
+          fun CrashReport() {
+              val ctx = LocalContext.current
+              val f = remember { File(ctx.filesDir, "crash.txt") }
+              var text by remember { mutableStateOf(if (f.exists()) f.readText().take(4000) else null) }
+              text?.let { t ->
+                  AlertDialog(
+                      onDismissRequest = {}, containerColor = Color(0xFF111111), title = { Text("O app fechou por um erro") },
+                      text = { Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) { Text(t, fontSize = 10.sp, color = Color.LightGray) } },
+                      confirmButton = { TextButton({ ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("erro", t)) }) { Text("Copiar", color = Turq) } },
+                      dismissButton = { TextButton({ f.delete(); text = null }) { Text("Fechar", color = Color.Gray) } }
+                  )
+              }
+          }
+
+          // ───────────────────────── Pesquisar ─────────────────────────
+          private val TOPICS = listOf(
+              "🎵 Músicas livres" to "música sem direitos autorais",
+              "📜 Creative Commons" to "creative commons",
+              "🎬 Trilhas p/ vídeos" to "trilha sonora livre para vídeos",
+              "🎙️ Podcasts" to "podcast",
+              "📚 Aulas e tutoriais" to "aula tutorial",
+              "🌿 Relaxamento" to "música relaxante sem copyright"
+          )
+
+          @Composable
+          fun SearchTab() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
+              var q by remember { mutableStateOf("") }
+              var link by remember { mutableStateOf("") }
+              var clip by remember { mutableStateOf<String?>(null) }
+              var linkUrl by remember { mutableStateOf<String?>(null) }
+              var sugg by remember { mutableStateOf(emptyList<String>()) }
+              var results by remember { mutableStateOf(emptyList<VideoItem>()) }
+              var loading by remember { mutableStateOf(false) }
+              var searched by remember { mutableStateOf(false) }
+              var pick by remember { mutableStateOf<VideoItem?>(null) }
+              var recents by remember { mutableStateOf((prefs.getString("recent", "") ?: "").split("\n").filter { it.isNotBlank() }) }
+              val jobs by Dl.jobs.collectAsState()
+
+              // Detecta link do YouTube copiado ao abrir a aba / voltar pro app
+              val owner = LocalLifecycleOwner.current
+              DisposableEffect(owner) {
+                  val o = LifecycleEventObserver { _, e ->
+                      if (e == Lifecycle.Event.ON_RESUME) {
+                          val t = ctx.getSystemService(ClipboardManager::class.java).primaryClip?.getItemAt(0)?.text?.toString()
+                          clip = t?.takeIf { YtRepo.isYt(it) }?.let { YtRepo.extract(it) }
+                      }
+                  }
+                  owner.lifecycle.addObserver(o); onDispose { owner.lifecycle.removeObserver(o) }
+              }
+
+              fun doSearch(text: String) = scope.launch {
+                  val t = text.trim(); if (t.isEmpty()) return@launch
+                  q = t; searched = true; sugg = emptyList(); loading = true
+                  recents = (listOf(t) + recents.filter { it != t }).take(8)
+                  prefs.edit().putString("recent", recents.joinToString("\n")).apply()
+                  results = runCatching { YtRepo.search(t) }.getOrDefault(emptyList())
+                  loading = false
+              }
+              LaunchedEffect(q, searched) { if (!searched && q.length >= 2) { delay(250); sugg = YtRepo.suggestions(q) } else sugg = emptyList() }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  // ── Colar link ──
+                  OutlinedTextField(
+                      link, { link = it; if (YtRepo.isYt(it)) linkUrl = YtRepo.extract(it) }, Modifier.fillMaxWidth(), singleLine = true,
+                      label = { Text("Cole o link do YouTube") },
+                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                      keyboardActions = KeyboardActions(onGo = { if (YtRepo.isYt(link)) linkUrl = YtRepo.extract(link) })
+                  )
+                  clip?.let { c ->
+                      Spacer(Modifier.height(8.dp))
+                      Card(Modifier.fillMaxWidth().clickable { linkUrl = c }, colors = CardDefaults.cardColors(containerColor = Color(0xFF0F2B28))) {
+                          Column(Modifier.padding(12.dp)) {
+                              Text("Link copiado detectado", color = Turq)
+                              Text(c, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.White)
+                              Text("Toque para baixar", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(10.dp))
+
+                  // ── Pesquisar ──
+                  OutlinedTextField(
+                      q, { q = it; searched = false; results = emptyList() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Pesquisar no YouTube") },
+                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                      keyboardActions = KeyboardActions(onSearch = { doSearch(q) })
+                  )
+                  sugg.forEach { s -> Text(s, Modifier.fillMaxWidth().clickable { doSearch(s) }.padding(vertical = 10.dp)) }
+                  if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp), color = Turq)
+
+                  if (results.isNotEmpty()) {
+                      LazyColumn {
+                          items(results) { v ->
+                              Row(Modifier.fillMaxWidth().clickable { pick = v }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  Thumb(v.thumb)
+                                  Spacer(Modifier.width(10.dp))
+                                  Column {
+                                      Text(v.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                      Text("${v.channel} • ${v.seconds / 60}:${"%02d".format(v.seconds % 60)}", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                                  }
+                              }
+                          }
+                      }
+                  } else if (!loading && q.isBlank()) {
+                      // ── Conteúdo da aba quando não há busca ──
+                      Column(Modifier.verticalScroll(rememberScrollState()).padding(top = 8.dp)) {
+                          Text("Sugestões para começar", color = Turq, style = MaterialTheme.typography.titleMedium)
+                          Spacer(Modifier.height(8.dp))
+                          TOPICS.chunked(2).forEach { row ->
+                              Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  row.forEach { (label, query) ->
+                                      Card(Modifier.weight(1f).clickable { doSearch(query) }, colors = CardDefaults.cardColors(containerColor = Color(0xFF111111))) {
+                                          Text(label, Modifier.padding(14.dp))
+                                      }
+                                  }
+                              }
+                          }
+
+                          if (recents.isNotEmpty()) {
+                              Spacer(Modifier.height(8.dp))
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Text("Pesquisas recentes", color = Turq, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                                  TextButton({ recents = emptyList(); prefs.edit().remove("recent").apply() }) { Text("Limpar", color = Color.Gray) }
+                              }
+                              recents.forEach { r -> Text("🕘  $r", Modifier.fillMaxWidth().clickable { doSearch(r) }.padding(vertical = 10.dp)) }
+                          }
+
+                          val active = jobs.filter { it.st != St.DONE }
+                          if (active.isNotEmpty()) {
+                              Spacer(Modifier.height(12.dp))
+                              Text("Baixando agora", color = Turq, style = MaterialTheme.typography.titleMedium)
+                              active.reversed().forEach { JobRow(it) }
+                          }
+
+                          Spacer(Modifier.height(12.dp))
+                          Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFF0F2B28))) {
+                              Column(Modifier.padding(14.dp)) {
+                                  Text("Dica", color = Turq)
+                                  Text(
+                                      "No YouTube, toque em Compartilhar e escolha Lindoso Download para baixar sem sair do app. " +
+                                          "Baixe apenas conteúdo seu, Creative Commons ou autorizado.",
+                                      color = Color.White, style = MaterialTheme.typography.bodySmall
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+              pick?.let { FormatDialog(it.url, it.title) { pick = null } }
+              linkUrl?.let { FormatDialog(it, it) { linkUrl = null; link = "" } }
+          }
+
+          /** Miniatura carregada sem biblioteca externa (mantém o APK pequeno). */
+          @Composable
+          fun Thumb(url: String?) {
+              val bmp by produceState<Bitmap?>(null, url) {
+                  value = url?.let { u -> withContext(Dispatchers.IO) { runCatching { URL(u).openStream().use { BitmapFactory.decodeStream(it) } }.getOrNull() } }
+              }
+              Box(Modifier.size(width = 110.dp, height = 62.dp).background(Color(0xFF111111))) {
+                  bmp?.let { androidx.compose.foundation.Image(it.asImageBitmap(), null, Modifier.fillMaxSize()) }
+              }
+          }
+
+          // ───────────────────────── Biblioteca ─────────────────────────
+          @Composable
+          fun LibraryTab() {
+              val ctx = LocalContext.current
+              var files by remember { mutableStateOf(emptyList<LFile>()) }
+              var tick by remember { mutableIntStateOf(0) }
+              val done = Dl.jobs.collectAsState().value.count { it.st == St.DONE }
+              LaunchedEffect(tick, done) { files = withContext(Dispatchers.IO) { Library.list(ctx) } }
+
+              var playing by remember { mutableStateOf<LFile?>(null) }
+              var renaming by remember { mutableStateOf<LFile?>(null) }
+              var deleting by remember { mutableStateOf<LFile?>(null) }
+              var moving by remember { mutableStateOf<LFile?>(null) }
+              val mover = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { dest ->
+                  val f = moving; moving = null
+                  if (dest != null && f != null) { Library.moveTo(ctx, f, dest); tick++ }
+              }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("Pasta: Download/Lindoso Download", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                  if (files.isEmpty()) Text("Nada baixado ainda.", Modifier.padding(top = 24.dp), color = Color.Gray)
+                  LazyColumn {
+                      items(files, key = { it.uri.toString() }) { f ->
+                          Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                              Text(f.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                              Text("%.1f MB".format(f.size / 1_048_576.0), color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                              Row {
+                                  TextButton({ playing = f }) { Text("Abrir", color = Turq) }
+                                  TextButton({ renaming = f }) { Text("Renomear", color = Turq) }
+                                  TextButton({ moving = f; mover.launch(f.name) }) { Text("Mover", color = Turq) }
+                                  TextButton({ deleting = f }) { Text("Excluir", color = Color(0xFFFF6B6B)) }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              playing?.let { f ->
+                  Dialog({ playing = null }) {
+                      AndroidView({ c ->
+                          VideoView(c).apply {
+                              setMediaController(MediaController(c).also { it.setAnchorView(this) })
+                              setVideoURI(f.uri); setOnPreparedListener { start() }
+                          }
+                      }, Modifier.fillMaxWidth().height(260.dp).background(Color.Black))
+                  }
+              }
+              renaming?.let { f ->
+                  var name by remember { mutableStateOf(f.name) }
+                  AlertDialog(
+                      onDismissRequest = { renaming = null }, containerColor = Color(0xFF111111), title = { Text("Renomear") },
+                      text = { OutlinedTextField(name, { name = it }, singleLine = true) },
+                      confirmButton = { TextButton({ Library.rename(ctx, f, name); renaming = null; tick++ }) { Text("Salvar", color = Turq) } },
+                      dismissButton = { TextButton({ renaming = null }) { Text("Cancelar", color = Color.Gray) } }
+                  )
+              }
+              deleting?.let { f ->
+                  AlertDialog(
+                      onDismissRequest = { deleting = null }, containerColor = Color(0xFF111111), title = { Text("Excluir arquivo?") },
+                      text = { Text(f.name) },
+                      confirmButton = { TextButton({ Library.delete(ctx, f); deleting = null; tick++ }) { Text("Excluir", color = Color(0xFFFF6B6B)) } },
+                      dismissButton = { TextButton({ deleting = null }) { Text("Cancelar", color = Color.Gray) } }
+                  )
+              }
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/lindoso/download/YtRepo.kt')"
+          cat > 'app/src/main/java/com/lindoso/download/YtRepo.kt' <<'LINDOSO_EOF'
+          package com.lindoso.download
+
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import org.schabi.newpipe.extractor.NewPipe
+          import org.schabi.newpipe.extractor.ServiceList
+          import org.schabi.newpipe.extractor.localization.Localization
+          import org.schabi.newpipe.extractor.playlist.PlaylistInfo
+          import org.schabi.newpipe.extractor.search.SearchInfo
+          import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeSearchQueryHandlerFactory
+          import org.schabi.newpipe.extractor.stream.StreamInfoItem
+
+          data class VideoItem(val url: String, val title: String, val channel: String, val thumb: String?, val seconds: Long)
+
+          /** Tudo que fala com o YouTube. Só YouTube, sem login, sem API key. */
+          object YtRepo {
+              private val yt get() = ServiceList.YouTube
+              private val ytRegex = Regex("""(https?://)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/\S+""", RegexOption.IGNORE_CASE)
+              private val listRegex = Regex("""[?&]list=([\w-]+)""")
+
+              fun init() = NewPipe.init(HttpDownloader(), Localization("pt", "BR"))
+
+              fun isYt(s: String) = ytRegex.containsMatchIn(s.trim())
+              fun extract(s: String): String = ytRegex.find(s.trim())!!.value.let { if (it.startsWith("http")) it else "https://$it" }
+              fun hasList(url: String) = listRegex.containsMatchIn(url)
+              fun playlistUrl(url: String) = "https://www.youtube.com/playlist?list=" + listRegex.find(url)!!.groupValues[1]
+
+              suspend fun suggestions(q: String): List<String> = withContext(Dispatchers.IO) {
+                  runCatching { yt.suggestionExtractor.suggestionList(q).take(6) }.getOrDefault(emptyList())
+              }
+
+              suspend fun search(q: String): List<VideoItem> = withContext(Dispatchers.IO) {
+                  val h = yt.searchQHFactory.fromQuery(q, listOf(YoutubeSearchQueryHandlerFactory.VIDEOS), "")
+                  SearchInfo.getInfo(yt, h).relatedItems.filterIsInstance<StreamInfoItem>().map(::toItem)
+              }
+
+              suspend fun playlist(url: String): List<VideoItem> = withContext(Dispatchers.IO) {
+                  val info = PlaylistInfo.getInfo(yt, url)
+                  val out = info.relatedItems.toMutableList()
+                  var page = info.nextPage
+                  while (page != null && out.size < 300) {
+                      val more = PlaylistInfo.getMoreItems(yt, url, page)
+                      out += more.items
+                      page = more.nextPage
+                  }
+                  out.map(::toItem)
+              }
+
+              private fun toItem(i: StreamInfoItem) =
+                  VideoItem(i.url, i.name, i.uploaderName ?: "", i.thumbnails.firstOrNull()?.url, i.duration)
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.png')"
+          base64 -d > 'app/src/main/res/drawable/ic_launcher.png' <<'LINDOSO_B64'
+          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
+          DDzn79v/BXN9JRthN4W/AAAAAElFTkSuQmCC
+          LINDOSO_B64
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'LINDOSO_EOF'
+          <resources>
+              <string name="app_name">Lindoso Download</string>
+          </resources>
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'LINDOSO_EOF'
+          <resources>
+              <style name="Theme.Lindoso" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:statusBarColor">#000000</item>
+                  <item name="android:navigationBarColor">#000000</item>
+                  <item name="android:colorAccent">#00E5C7</item>
+              </style>
+              <style name="Theme.Lindoso.Sheet" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:backgroundDimEnabled">true</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">#151515</item>
+              </style>
+          </resources>
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'LINDOSO_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'LINDOSO_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          LINDOSO_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'LINDOSO_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io") // NewPipeExtractor
+              }
+          }
+          rootProject.name = "LindosoDownload"
+          include(":app")
+          LINDOSO_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LindosoDownload-apk
+          path: app/build/outputs/apk/debug/*.apk
